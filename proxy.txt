@@ -1,0 +1,2 @@
+geo.iproyal.com:42324:10Okt22:RkNJv8_session-zjf2f81p_lifetime-24h
+geo.iproyal.com:42324:10Okt22:RkNJv8_session-mf1cs6tq_lifetime-24h
