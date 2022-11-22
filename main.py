@@ -1,9 +1,11 @@
 import sys
 import os
 from PySide6.QtWidgets import QApplication, QMainWindow, QTableWidgetItem, QPushButton, QCheckBox
+from PySide6.QtCore import QThread, Signal
 from design import Ui_MainWindow
 from telethon.sync import TelegramClient
 from telethon.errors import rpcerrorlist
+from multiprocessing import Manager
 import socks
 import schedule
 from time import sleep
@@ -13,25 +15,33 @@ import csv
 import json
 
 
-class Session:
-    def __init__(self, name, setting, processes):
-        self.name = name
-        self.setting = setting
-        self.connected = False
-        while 1:
-            target = processes.get(name, {})
-            target_name = target.get('name', '')
-            if target_name == 'connect':
-                connected, text = self.connect()
-                processes[name] = {'result': connected, 'answer': text}
-            if target_name == 'close':
-                del processes[name]
-                break
+class Session(QThread):
+    answer = Signal(str, bool, str, str)
+    getting = Signal(str, dict)
 
-    def connect(self):
+    def __init__(self, name, session):
+        super(Session, self).__init__()
+        self.name = name
+        self.session = session
+        self.connected = False
+        self.client = None
+
+    def run(self) -> None:
+        self.getting.connect(self.get_target)
+
+    def __del__(self):
+        self.wait()
+
+    def get_target(self, name, values):
+        print('get')
+        if name == 'connect':
+            connected, text = self.connecting()
+            self.answer.emit(self.name, connected, name, text)
+
+    def connecting(self):
         try:
-            session = self.setting['sessions'][self.name]
-            data = self.setting['sessions'][self.name].get('data', {})
+            session = self.session
+            data = self.session.get('data', {})
             self.client = TelegramClient(session['session_path'], api_id=data.get('app_id'),
                                          api_hash=data.get('app_hash'),
                                          proxy=(socks.SOCKS5, session.get('addr'), int(session.get('port')), True,
@@ -45,14 +55,11 @@ class Session:
                 self.connected = True
                 return True, 'success'
             else:
-                print(f'{self.name} is not authorized or banned')
-                return False, 'is not authorized or banned'
+                return False, f'{self.name}  is not authorized or banned'
         except rpcerrorlist.AuthKeyDuplicatedError:
-            print(f'session file for {self.name} timeout')
-            return False, 'session file timeout'
+            return False, f'session {self.name} file timeout'
         except BaseException as e:
-            print(f'unknown error sent to @artemki2077 {e}')
-            return False, 'other error'
+            return False, f'other error {e}'
 
 
 class Telegrammer(QMainWindow):
@@ -66,10 +73,6 @@ class Telegrammer(QMainWindow):
         super(Telegrammer, self).__init__()
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
-
-        self.meneger = Manager()
-        self.m_setting = self.meneger.dict(self.setting)
-        self.m_targets = self.meneger.dict({})
 
         if 'setting.json' in os.listdir():
             self.read()
@@ -93,39 +96,17 @@ class Telegrammer(QMainWindow):
 
         self.ui.btn_connect.clicked.connect(self.sessions_connect)
 
-        schedule.every(1).seconds.do(self.updater)
-        schedule.run_pending()
-
         if self.setting.get('sessions') is None:
             self.setting['sessions'] = {}
 
         self.write()
 
-    def updater(self):
-        print('check...')
-        if self.waiting:
-            for i in self.m_targets:
-                target = self.m_targets[i]
-
-                if target.get('result') is None:
-                    pass
-                elif target.get('result') == True:
-                    self.colored_table_sessions(self.setting.get('sessions', {}).keys().index(i), (0, 128, 0))
-                elif target.get('result') == False:
-                    self.colored_table_sessions(self.setting.get('sessions', {}).keys().index(i), (128, 0, 0))
-
-            if not len(self.m_targets):
-                self.ui.out_concole.setText(f'>>> SUCCESS')
-                self.waiting = False
-                self.ui.out_concole.setStyleSheet('background-color:  rgb(0, 0, 0);color: rgb(0, 128, 0)')
-            else:
-                self.count_dot += 1
-                if self.count_dot == 4:
-                    self.count_dot = 0
-                self.ui.out_concole.setText(f'>>> Waiting{"." * self.count_dot}')
-                self.ui.out_concole.setStyleSheet('background-color:  rgb(0, 0, 0);color: rgb(255, 255, 255)')
+    def answer(self, session: str, result: bool, name: str, text: str):
+        print(session, result, name, text)
+        if result:
+            self.colored_table_sessions(list(self.setting.get('sessions', {}).keys()).index(session), (0, 255, 0))
         else:
-            pass
+            self.colored_table_sessions(list(self.setting.get('sessions', {}).keys()).index(session), (255, 0, 0))
 
     def admined(self) -> None:
         btn = self.sender()
@@ -138,7 +119,6 @@ class Telegrammer(QMainWindow):
 
     def delete(self) -> None:
         btn = self.sender()
-        print(btn.name)
         name = btn.name
         session = self.setting['sessions'].get(name)
         if session is None:
@@ -167,7 +147,7 @@ class Telegrammer(QMainWindow):
         self.ui.table_sessions.setCellWidget(rowPosition, 8, del_button)
 
     def sessions_connect(self):
-        ses = self.setting.get('sessions', {})
+        ses: dict = self.setting.get('sessions', {})
         sessions: list = list(filter(
             lambda x: False not in [ses[x].get('data', False), ses[x].get('addr', False), ses[x].get('port', False),
                                     ses[x].get('login', False),
@@ -176,13 +156,14 @@ class Telegrammer(QMainWindow):
         self.ui.out_concole.setStyleSheet('background-color:  rgb(0, 0, 0);color: rgb(255, 255, 255)')
         for i in sessions:
             if i not in self.processes:
-                self.processes[i] = {'process': Process(target=Session, args=(i, self.m_setting, self.m_targets,))}
-                self.processes[i]['process'].start()
-            self.m_targets[i] = {'name': 'connect'}
+                self.processes[i] = Session(i, self.setting.get('sessions', {}).get(i, {}))
+                self.processes[i].answer.connect(self.answer)
+                self.processes[i].start()
+            self.processes[i].getting.emit('connect', None)
+            self.colored_table_sessions(list(ses.keys()).index(i), (255, 255, 0))
 
     def colored_table_sessions(self, x: int, color: tuple):
-        for i in range(9):
-            self.ui.table_sessions.item(x, i).setBackground(QtGui.QColor(*color))
+        self.ui.table_sessions.item(x, 1).setBackground(QtGui.QColor(*color))
 
     def write(self):
         self.tab_update()
@@ -194,7 +175,6 @@ class Telegrammer(QMainWindow):
             self.setting = json.load(f)
 
     def tab_update(self):
-        self.m_setting = self.meneger.dict(self.setting)
         self.ui.table_sessions.clear()
         self.ui.table_sessions.setRowCount(0)
         self.ui.table_sessions.setHorizontalHeaderLabels(
@@ -240,7 +220,6 @@ class Telegrammer(QMainWindow):
             n_proxy = 0
             for i in sessions:
                 if ln_proxy == n_proxy:
-
                     break
                 obj = sessions[i]
                 if not obj.get('addr'):
